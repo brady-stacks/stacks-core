@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use clarity_types::execution_cost::ExecutionCost;
 use clarity_types::representations::ClarityName;
 pub use clarity_types::types::FunctionIdentifier;
 use stacks_common::types::StacksEpochId;
@@ -51,6 +52,7 @@ pub enum CallableType {
     ),
     SpecialFunction(
         &'static str,
+        &'static dyn Fn(&[Value]) -> ExecutionCost,
         &'static dyn Fn(
             &[SymbolicExpression],
             &mut Environment,
@@ -398,7 +400,7 @@ impl CallableType {
         match self {
             CallableType::UserFunction(f) => f.get_identifier(),
             CallableType::NativeFunction(s, _, _) => FunctionIdentifier::new_native_function(s),
-            CallableType::SpecialFunction(s, _) => FunctionIdentifier::new_native_function(s),
+            CallableType::SpecialFunction(s, _, _) => FunctionIdentifier::new_native_function(s),
             CallableType::NativeFunction205(s, _, _, _) => {
                 FunctionIdentifier::new_native_function(s)
             }

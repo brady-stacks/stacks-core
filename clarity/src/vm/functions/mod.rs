@@ -79,6 +79,7 @@ mod options;
 mod post_conditions;
 pub mod principals;
 mod sequences;
+mod special_costs;
 pub mod tuples;
 
 define_versioned_named_enum_with_max!(NativeFunctions(ClarityVersion) {
@@ -233,10 +234,26 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::MoreArg(&arithmetic::native_div),
                 ClarityCostFunction::Div,
             ),
-            CmpGeq => SpecialFunction("special_geq", &arithmetic::special_geq),
-            CmpLeq => SpecialFunction("special_leq", &arithmetic::special_leq),
-            CmpLess => SpecialFunction("special_le", &arithmetic::special_less),
-            CmpGreater => SpecialFunction("special_ge", &arithmetic::special_greater),
+            CmpGeq => SpecialFunction(
+                "special_geq",
+                &special_costs::cost_binary_comparison,
+                &arithmetic::special_geq,
+            ),
+            CmpLeq => SpecialFunction(
+                "special_leq",
+                &special_costs::cost_binary_comparison,
+                &arithmetic::special_leq,
+            ),
+            CmpLess => SpecialFunction(
+                "special_le",
+                &special_costs::cost_binary_comparison,
+                &arithmetic::special_less,
+            ),
+            CmpGreater => SpecialFunction(
+                "special_ge",
+                &special_costs::cost_binary_comparison,
+                &arithmetic::special_greater,
+            ),
             ToUInt => NativeFunction(
                 "native_to_uint",
                 NativeHandle::SingleArg(&arithmetic::native_to_uint),
@@ -272,8 +289,16 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::DoubleArg(&arithmetic::native_xor),
                 ClarityCostFunction::Xor,
             ),
-            And => SpecialFunction("special_and", &boolean::special_and),
-            Or => SpecialFunction("special_or", &boolean::special_or),
+            And => SpecialFunction(
+                "special_and",
+                &special_costs::cost_boolean_operation,
+                &boolean::special_and,
+            ),
+            Or => SpecialFunction(
+                "special_or",
+                &special_costs::cost_boolean_operation,
+                &boolean::special_or,
+            ),
             Not => NativeFunction(
                 "native_not",
                 NativeHandle::SingleArg(&boolean::native_not),
@@ -285,12 +310,28 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 ClarityCostFunction::Eq,
                 &cost_input_sized_vararg,
             ),
-            If => SpecialFunction("special_if", &special_if),
-            Let => SpecialFunction("special_let", &special_let),
-            FetchVar => SpecialFunction("special_var-get", &database::special_fetch_variable),
-            SetVar => SpecialFunction("special_set-var", &database::special_set_variable),
-            Map => SpecialFunction("special_map", &sequences::special_map),
-            Filter => SpecialFunction("special_filter", &sequences::special_filter),
+            If => SpecialFunction("special_if", &special_costs::cost_zero, &special_if),
+            Let => SpecialFunction("special_let", &special_costs::cost_zero, &special_let),
+            FetchVar => SpecialFunction(
+                "special_var-get",
+                &special_costs::cost_zero,
+                &database::special_fetch_variable,
+            ),
+            SetVar => SpecialFunction(
+                "special_set-var",
+                &special_costs::cost_zero,
+                &database::special_set_variable,
+            ),
+            Map => SpecialFunction(
+                "special_map",
+                &special_costs::cost_by_total_size,
+                &sequences::special_map,
+            ),
+            Filter => SpecialFunction(
+                "special_filter",
+                &special_costs::cost_by_total_size,
+                &sequences::special_filter,
+            ),
             BuffToIntLe => NativeFunction(
                 "native_buff_to_int_le",
                 NativeHandle::SingleArg(&conversions::native_buff_to_int_le),
@@ -331,19 +372,41 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::SingleArg(&conversions::native_int_to_utf8),
                 ClarityCostFunction::IntToUtf8,
             ),
-            IsStandard => SpecialFunction("special_is_standard", &principals::special_is_standard),
+            IsStandard => SpecialFunction(
+                "special_is_standard",
+                &special_costs::cost_by_arg_count,
+                &principals::special_is_standard,
+            ),
             PrincipalDestruct => SpecialFunction(
                 "special_principal_destruct",
+                &special_costs::cost_by_arg_count,
                 &principals::special_principal_destruct,
             ),
             PrincipalConstruct => SpecialFunction(
                 "special_principal_construct",
+                &special_costs::cost_by_arg_count,
                 &principals::special_principal_construct,
             ),
-            Fold => SpecialFunction("special_fold", &sequences::special_fold),
-            Concat => SpecialFunction("special_concat", &sequences::special_concat),
-            AsMaxLen => SpecialFunction("special_as_max_len", &sequences::special_as_max_len),
-            Append => SpecialFunction("special_append", &sequences::special_append),
+            Fold => SpecialFunction(
+                "special_fold",
+                &special_costs::cost_by_total_size,
+                &sequences::special_fold,
+            ),
+            Concat => SpecialFunction(
+                "special_concat",
+                &special_costs::cost_by_total_size,
+                &sequences::special_concat,
+            ),
+            AsMaxLen => SpecialFunction(
+                "special_as_max_len",
+                &special_costs::cost_by_arg_count,
+                &sequences::special_as_max_len,
+            ),
+            Append => SpecialFunction(
+                "special_append",
+                &special_costs::cost_by_total_size,
+                &sequences::special_append,
+            ),
             Len => NativeFunction(
                 "native_len",
                 NativeHandle::SingleArg(&sequences::native_len),
@@ -360,14 +423,46 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 ClarityCostFunction::IndexOf,
                 &cost_input_sized_vararg,
             ),
-            Slice => SpecialFunction("special_slice", &sequences::special_slice),
-            ListCons => SpecialFunction("special_list_cons", &sequences::list_cons),
-            FetchEntry => SpecialFunction("special_map-get?", &database::special_fetch_entry),
-            SetEntry => SpecialFunction("special_set-entry", &database::special_set_entry),
-            InsertEntry => SpecialFunction("special_insert-entry", &database::special_insert_entry),
-            DeleteEntry => SpecialFunction("special_delete-entry", &database::special_delete_entry),
-            TupleCons => SpecialFunction("special_tuple", &tuples::tuple_cons),
-            TupleGet => SpecialFunction("special_get-tuple", &tuples::tuple_get),
+            Slice => SpecialFunction(
+                "special_slice",
+                &special_costs::cost_by_total_size,
+                &sequences::special_slice,
+            ),
+            ListCons => SpecialFunction(
+                "special_list_cons",
+                &special_costs::cost_by_total_size,
+                &sequences::list_cons,
+            ),
+            FetchEntry => SpecialFunction(
+                "special_map-get?",
+                &special_costs::cost_zero,
+                &database::special_fetch_entry,
+            ),
+            SetEntry => SpecialFunction(
+                "special_set-entry",
+                &special_costs::cost_zero,
+                &database::special_set_entry,
+            ),
+            InsertEntry => SpecialFunction(
+                "special_insert-entry",
+                &special_costs::cost_zero,
+                &database::special_insert_entry,
+            ),
+            DeleteEntry => SpecialFunction(
+                "special_delete-entry",
+                &special_costs::cost_zero,
+                &database::special_delete_entry,
+            ),
+            TupleCons => SpecialFunction(
+                "special_tuple",
+                &special_costs::cost_by_total_size,
+                &tuples::tuple_cons,
+            ),
+            TupleGet => SpecialFunction(
+                "special_get-tuple",
+                &special_costs::cost_by_arg_count,
+                &tuples::tuple_get,
+            ),
             TupleMerge => NativeFunction205(
                 "native_merge-tuple",
                 NativeHandle::DoubleArg(&tuples::tuple_merge),
@@ -411,31 +506,53 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
             ),
             Secp256k1Recover => SpecialFunction(
                 "native_secp256k1-recover",
+                &special_costs::cost_by_total_size,
                 &crypto::special_secp256k1_recover,
             ),
-            Secp256k1Verify => {
-                SpecialFunction("native_secp256k1-verify", &crypto::special_secp256k1_verify)
-            }
-            Print => SpecialFunction("special_print", &special_print),
-            ContractCall => {
-                SpecialFunction("special_contract-call", &database::special_contract_call)
-            }
-            AsContract => SpecialFunction("special_as-contract", &special_as_contract),
-            ContractOf => SpecialFunction("special_contract-of", &special_contract_of),
-            PrincipalOf => SpecialFunction("special_principal-of", &crypto::special_principal_of),
-            GetBlockInfo => {
-                SpecialFunction("special_get_block_info", &database::special_get_block_info)
-            }
+            Secp256k1Verify => SpecialFunction(
+                "native_secp256k1-verify",
+                &special_costs::cost_by_total_size,
+                &crypto::special_secp256k1_verify,
+            ),
+            Print => SpecialFunction("special_print", &special_costs::cost_zero, &special_print),
+            ContractCall => SpecialFunction(
+                "special_contract-call",
+                &special_costs::cost_zero,
+                &database::special_contract_call,
+            ),
+            AsContract => SpecialFunction(
+                "special_as-contract",
+                &special_costs::cost_zero,
+                &special_as_contract,
+            ),
+            ContractOf => SpecialFunction(
+                "special_contract-of",
+                &special_costs::cost_by_arg_count,
+                &special_contract_of,
+            ),
+            PrincipalOf => SpecialFunction(
+                "special_principal-of",
+                &special_costs::cost_by_arg_count,
+                &crypto::special_principal_of,
+            ),
+            GetBlockInfo => SpecialFunction(
+                "special_get_block_info",
+                &special_costs::cost_zero,
+                &database::special_get_block_info,
+            ),
             GetBurnBlockInfo => SpecialFunction(
                 "special_get_burn_block_info",
+                &special_costs::cost_zero,
                 &database::special_get_burn_block_info,
             ),
             GetStacksBlockInfo => SpecialFunction(
                 "special_get_stacks_block_info",
+                &special_costs::cost_zero,
                 &database::special_get_stacks_block_info,
             ),
             GetTenureInfo => SpecialFunction(
                 "special_get_tenure_info",
+                &special_costs::cost_zero,
                 &database::special_get_tenure_info,
             ),
             ConsSome => NativeFunction(
@@ -458,7 +575,11 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::DoubleArg(&options::native_default_to),
                 ClarityCostFunction::DefaultTo,
             ),
-            Asserts => SpecialFunction("special_asserts", &special_asserts),
+            Asserts => SpecialFunction(
+                "special_asserts",
+                &special_costs::cost_zero,
+                &special_asserts,
+            ),
             UnwrapRet => NativeFunction(
                 "native_unwrap_ret",
                 NativeHandle::DoubleArg(&options::native_unwrap_or_ret),
@@ -499,47 +620,107 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::SingleArg(&options::native_unwrap_err),
                 ClarityCostFunction::UnwrapErr,
             ),
-            Match => SpecialFunction("special_match", &options::special_match),
+            Match => SpecialFunction(
+                "special_match",
+                &special_costs::cost_zero,
+                &options::special_match,
+            ),
             TryRet => NativeFunction(
                 "native_try_ret",
                 NativeHandle::SingleArg(&options::native_try_ret),
                 ClarityCostFunction::TryRet,
             ),
-            MintAsset => SpecialFunction("special_mint_asset", &assets::special_mint_asset),
-            MintToken => SpecialFunction("special_mint_token", &assets::special_mint_token),
-            TransferAsset => {
-                SpecialFunction("special_transfer_asset", &assets::special_transfer_asset)
-            }
-            TransferToken => {
-                SpecialFunction("special_transfer_token", &assets::special_transfer_token)
-            }
-            GetTokenBalance => SpecialFunction("special_get_balance", &assets::special_get_balance),
-            GetAssetOwner => SpecialFunction("special_get_owner", &assets::special_get_owner),
-            BurnAsset => SpecialFunction("special_burn_asset", &assets::special_burn_asset),
-            BurnToken => SpecialFunction("special_burn_token", &assets::special_burn_token),
+            MintAsset => SpecialFunction(
+                "special_mint_asset",
+                &special_costs::cost_zero,
+                &assets::special_mint_asset,
+            ),
+            MintToken => SpecialFunction(
+                "special_mint_token",
+                &special_costs::cost_zero,
+                &assets::special_mint_token,
+            ),
+            TransferAsset => SpecialFunction(
+                "special_transfer_asset",
+                &special_costs::cost_zero,
+                &assets::special_transfer_asset,
+            ),
+            TransferToken => SpecialFunction(
+                "special_transfer_token",
+                &special_costs::cost_zero,
+                &assets::special_transfer_token,
+            ),
+            GetTokenBalance => SpecialFunction(
+                "special_get_balance",
+                &special_costs::cost_zero,
+                &assets::special_get_balance,
+            ),
+            GetAssetOwner => SpecialFunction(
+                "special_get_owner",
+                &special_costs::cost_zero,
+                &assets::special_get_owner,
+            ),
+            BurnAsset => SpecialFunction(
+                "special_burn_asset",
+                &special_costs::cost_zero,
+                &assets::special_burn_asset,
+            ),
+            BurnToken => SpecialFunction(
+                "special_burn_token",
+                &special_costs::cost_zero,
+                &assets::special_burn_token,
+            ),
             GetTokenSupply => SpecialFunction(
                 "special_get_token_supply",
+                &special_costs::cost_zero,
                 &assets::special_get_token_supply,
             ),
-            AtBlock => SpecialFunction("special_at_block", &database::special_at_block),
-            GetStxBalance => SpecialFunction("special_stx_balance", &assets::special_stx_balance),
-            StxTransfer => SpecialFunction("special_stx_transfer", &assets::special_stx_transfer),
+            AtBlock => SpecialFunction(
+                "special_at_block",
+                &special_costs::cost_zero,
+                &database::special_at_block,
+            ),
+            GetStxBalance => SpecialFunction(
+                "special_stx_balance",
+                &special_costs::cost_zero,
+                &assets::special_stx_balance,
+            ),
+            StxTransfer => SpecialFunction(
+                "special_stx_transfer",
+                &special_costs::cost_zero,
+                &assets::special_stx_transfer,
+            ),
             StxTransferMemo => SpecialFunction(
                 "special_stx_transfer_memo",
+                &special_costs::cost_zero,
                 &assets::special_stx_transfer_memo,
             ),
-            StxBurn => SpecialFunction("special_stx_burn", &assets::special_stx_burn),
-            StxGetAccount => SpecialFunction("stx_get_account", &assets::special_stx_account),
+            StxBurn => SpecialFunction(
+                "special_stx_burn",
+                &special_costs::cost_zero,
+                &assets::special_stx_burn,
+            ),
+            StxGetAccount => SpecialFunction(
+                "stx_get_account",
+                &special_costs::cost_zero,
+                &assets::special_stx_account,
+            ),
             ToConsensusBuff => NativeFunction205(
                 "to_consensus_buff",
                 NativeHandle::SingleArg(&conversions::to_consensus_buff),
                 ClarityCostFunction::ToConsensusBuff,
                 &cost_input_sized_vararg,
             ),
-            FromConsensusBuff => {
-                SpecialFunction("from_consensus_buff", &conversions::from_consensus_buff)
-            }
-            ReplaceAt => SpecialFunction("replace_at", &sequences::special_replace_at),
+            FromConsensusBuff => SpecialFunction(
+                "from_consensus_buff",
+                &special_costs::cost_by_total_size,
+                &conversions::from_consensus_buff,
+            ),
+            ReplaceAt => SpecialFunction(
+                "replace_at",
+                &special_costs::cost_by_total_size,
+                &sequences::special_replace_at,
+            ),
             BitwiseAnd => NativeFunction(
                 "native_bitwise_and",
                 NativeHandle::MoreArg(&arithmetic::native_bitwise_and),
@@ -570,27 +751,40 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
                 NativeHandle::MoreArg(&arithmetic::native_bitwise_xor),
                 ClarityCostFunction::Xor,
             ),
-            ContractHash => {
-                SpecialFunction("special_contract_hash", &database::special_contract_hash)
-            }
-            ToAscii => SpecialFunction("special_to_ascii", &conversions::special_to_ascii),
+            ContractHash => SpecialFunction(
+                "special_contract_hash",
+                &special_costs::cost_by_arg_count,
+                &database::special_contract_hash,
+            ),
+            ToAscii => SpecialFunction(
+                "special_to_ascii",
+                &special_costs::cost_by_total_size,
+                &conversions::special_to_ascii,
+            ),
             RestrictAssets => SpecialFunction(
                 "special_restrict_assets",
+                &special_costs::cost_zero,
                 &post_conditions::special_restrict_assets,
             ),
-            AsContractSafe => {
-                SpecialFunction("special_as_contract", &post_conditions::special_as_contract)
-            }
+            AsContractSafe => SpecialFunction(
+                "special_as_contract",
+                &special_costs::cost_zero,
+                &post_conditions::special_as_contract,
+            ),
             AllowanceWithStx
             | AllowanceWithFt
             | AllowanceWithNft
             | AllowanceWithStacking
-            | AllowanceAll => {
-                SpecialFunction("special_allowance", &post_conditions::special_allowance)
-            }
-            Secp256r1Verify => {
-                SpecialFunction("native_secp256r1-verify", &crypto::special_secp256r1_verify)
-            }
+            | AllowanceAll => SpecialFunction(
+                "special_allowance",
+                &special_costs::cost_zero,
+                &post_conditions::special_allowance,
+            ),
+            Secp256r1Verify => SpecialFunction(
+                "native_secp256r1-verify",
+                &special_costs::cost_by_total_size,
+                &crypto::special_secp256r1_verify,
+            ),
         };
         Some(callable)
     } else {

@@ -246,10 +246,43 @@ pub fn apply(
         return Err(RuntimeError::MaxStackDepthReached.into());
     }
 
-    if let CallableType::SpecialFunction(_, function) = function {
+    if let CallableType::SpecialFunction(_, cost_fn, function) = function {
+        // Evaluate arguments first
+        let mut used_memory = 0;
+        let mut evaluated_args = Vec::with_capacity(args.len());
+        env.call_stack.incr_apply_depth();
+        for arg_x in args.iter() {
+            let arg_value = match eval(arg_x, env, context) {
+                Ok(x) => x,
+                Err(e) => {
+                    env.drop_memory(used_memory)?;
+                    env.call_stack.decr_apply_depth();
+                    return Err(e);
+                }
+            };
+            let arg_use = arg_value.get_memory_use()?;
+            match env.add_memory(arg_use) {
+                Ok(_x) => {}
+                Err(e) => {
+                    env.drop_memory(used_memory)?;
+                    env.call_stack.decr_apply_depth();
+                    return Err(VmExecutionError::from(e));
+                }
+            };
+            used_memory += arg_value.get_memory_use()?;
+            evaluated_args.push(arg_value);
+        }
+        env.call_stack.decr_apply_depth();
+
+        // Compute cost using the cost function with evaluated arguments
+        let cost = cost_fn(evaluated_args.as_slice());
+        env.add_cost(cost).map_err(VmExecutionError::from)?;
+
+        // Now execute the function with the original unevaluated arguments
         env.call_stack.insert(&identifier, track_recursion);
         let mut resp = function(args, env, context);
         add_stack_trace(&mut resp, env);
+        env.drop_memory(used_memory)?;
         env.call_stack.remove(&identifier, track_recursion)?;
         resp
     } else {

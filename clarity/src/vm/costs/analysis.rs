@@ -6,8 +6,9 @@ use clarity_types::types::TraitIdentifier;
 use stacks_common::types::StacksEpochId;
 
 use crate::vm::ast::build_ast;
-#[cfg(test)]
+#[cfg(all(test, feature = "developer-mode"))]
 use crate::vm::ast::static_cost::is_node_branching;
+#[cfg(feature = "developer-mode")]
 use crate::vm::ast::static_cost::{
     calculate_function_cost, calculate_function_cost_from_native_function,
     calculate_total_cost_with_branching, calculate_value_cost, TraitCount, TraitCountCollector,
@@ -513,6 +514,24 @@ fn get_function_name(expr: &SymbolicExpression) -> Result<ClarityName, String> {
     }
 }
 
+/// Helper function to extract Values from argument expressions for cost computation
+/// Returns Some(values) if all arguments can be statically evaluated, None otherwise
+fn extract_argument_values(exprs: &[SymbolicExpression]) -> Option<Vec<Value>> {
+    let mut values = Vec::new();
+    for expr in exprs.iter() {
+        // Try to extract value from AtomValue or LiteralValue
+        if let Some(value) = expr.match_atom_value() {
+            values.push(value.clone());
+        } else if let Some(value) = expr.match_literal_value() {
+            values.push(value.clone());
+        } else {
+            // If any argument can't be statically evaluated, return None
+            return None;
+        }
+    }
+    Some(values)
+}
+
 /// Helper function to build expression trees for both lists and tuples
 fn build_listlike_cost_analysis_tree(
     exprs: &[SymbolicExpression],
@@ -544,12 +563,18 @@ fn build_listlike_cost_analysis_tree(
         SymbolicExpressionType::Atom(name) => {
             // Try to get function name from first element
             // Try to lookup the function as a native function first
+            // special functions
+            //   - let, etc use bindings lengths not argument lengths
             if let Some(native_function) =
                 NativeFunctions::lookup_by_name_at_version(name.as_str(), clarity_version)
             {
+                // Try to extract argument values for SpecialFunction cost computation
+                // If we can't extract all values statically, pass None (will result in zero cost for SpecialFunction)
+                let arg_values = extract_argument_values(&exprs[1..]);
                 let cost = calculate_function_cost_from_native_function(
                     native_function,
                     children.len() as u64,
+                    arg_values,
                     epoch,
                 )?;
                 (CostExprNode::NativeFunction(native_function), cost)

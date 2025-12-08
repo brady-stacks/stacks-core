@@ -98,43 +98,77 @@ pub(crate) fn calculate_value_cost(value: &Value) -> Result<StaticCost, String> 
 pub(crate) fn calculate_function_cost_from_native_function(
     native_function: NativeFunctions,
     arg_count: u64,
+    args: Option<Vec<Value>>,
     epoch: StacksEpochId,
 ) -> Result<StaticCost, String> {
     // Derive clarity_version from epoch for lookup_reserved_functions
     let clarity_version = ClarityVersion::default_for_epoch(epoch);
-    let cost_function =
-        match lookup_reserved_functions(native_function.to_string().as_str(), &clarity_version) {
-            Some(CallableType::NativeFunction(_, _, cost_fn)) => cost_fn,
-            Some(CallableType::NativeFunction205(_, _, cost_fn, _)) => cost_fn,
-            Some(CallableType::SpecialFunction(_, _)) => return Ok(StaticCost::ZERO),
-            Some(CallableType::UserFunction(_)) => return Ok(StaticCost::ZERO), // TODO ?
-            None => {
-                return Ok(StaticCost::ZERO);
+    match lookup_reserved_functions(native_function.to_string().as_str(), &clarity_version) {
+        Some(CallableType::NativeFunction(_, _, cost_fn)) => {
+            let cost = match epoch {
+                StacksEpochId::Epoch20 => cost_fn.eval::<Costs1>(arg_count),
+                StacksEpochId::Epoch2_05 => cost_fn.eval::<Costs2>(arg_count),
+                StacksEpochId::Epoch21
+                | StacksEpochId::Epoch22
+                | StacksEpochId::Epoch23
+                | StacksEpochId::Epoch24
+                | StacksEpochId::Epoch25
+                | StacksEpochId::Epoch30
+                | StacksEpochId::Epoch31
+                | StacksEpochId::Epoch32 => cost_fn.eval::<Costs3>(arg_count),
+                StacksEpochId::Epoch33 => cost_fn.eval::<Costs4>(arg_count),
+                StacksEpochId::Epoch10 => {
+                    // fallback to costs 1 since epoch 1 doesn't have direct cost mapping
+                    cost_fn.eval::<Costs1>(arg_count)
+                }
             }
-        };
-
-    let cost = match epoch {
-        StacksEpochId::Epoch20 => cost_function.eval::<Costs1>(arg_count),
-        StacksEpochId::Epoch2_05 => cost_function.eval::<Costs2>(arg_count),
-        StacksEpochId::Epoch21
-        | StacksEpochId::Epoch22
-        | StacksEpochId::Epoch23
-        | StacksEpochId::Epoch24
-        | StacksEpochId::Epoch25
-        | StacksEpochId::Epoch30
-        | StacksEpochId::Epoch31
-        | StacksEpochId::Epoch32 => cost_function.eval::<Costs3>(arg_count),
-        StacksEpochId::Epoch33 => cost_function.eval::<Costs4>(arg_count),
-        StacksEpochId::Epoch10 => {
-            // fallback to costs 1 since epoch 1 doesn't have direct cost mapping
-            cost_function.eval::<Costs1>(arg_count)
+            .map_err(|e| format!("Cost calculation error: {:?}", e))?;
+            Ok(StaticCost {
+                min: cost.clone(),
+                max: cost,
+            })
         }
+        Some(CallableType::NativeFunction205(_, _, cost_fn, _)) => {
+            let cost = match epoch {
+                StacksEpochId::Epoch20 => cost_fn.eval::<Costs1>(arg_count),
+                StacksEpochId::Epoch2_05 => cost_fn.eval::<Costs2>(arg_count),
+                StacksEpochId::Epoch21
+                | StacksEpochId::Epoch22
+                | StacksEpochId::Epoch23
+                | StacksEpochId::Epoch24
+                | StacksEpochId::Epoch25
+                | StacksEpochId::Epoch30
+                | StacksEpochId::Epoch31
+                | StacksEpochId::Epoch32 => cost_fn.eval::<Costs3>(arg_count),
+                StacksEpochId::Epoch33 => cost_fn.eval::<Costs4>(arg_count),
+                StacksEpochId::Epoch10 => {
+                    // fallback to costs 1 since epoch 1 doesn't have direct cost mapping
+                    cost_fn.eval::<Costs1>(arg_count)
+                }
+            }
+            .map_err(|e| format!("Cost calculation error: {:?}", e))?;
+            Ok(StaticCost {
+                min: cost.clone(),
+                max: cost,
+            })
+        }
+        Some(CallableType::SpecialFunction(_, cost_fn, _)) => {
+            // For SpecialFunction, the cost function takes evaluated arguments
+            if let Some(evaluated_args) = args {
+                let cost = cost_fn(evaluated_args.as_slice());
+                Ok(StaticCost {
+                    min: cost.clone(),
+                    max: cost,
+                })
+            } else {
+                // If args are not available, return zero cost
+                // This can happen during static analysis when values aren't known
+                Ok(StaticCost::ZERO)
+            }
+        }
+        Some(CallableType::UserFunction(_)) => Ok(StaticCost::ZERO), // TODO ?
+        None => Ok(StaticCost::ZERO),
     }
-    .map_err(|e| format!("Cost calculation error: {:?}", e))?;
-    Ok(StaticCost {
-        min: cost.clone(),
-        max: cost,
-    })
 }
 
 /// total cost handling branching

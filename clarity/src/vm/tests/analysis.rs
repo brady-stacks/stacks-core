@@ -82,6 +82,11 @@ fn test_dependent_function_calls() {
     assert!(add_one_cost.min.runtime >= somefunc_cost.min.runtime);
     assert!(add_one_cost.max.runtime >= somefunc_cost.max.runtime);
 }
+// #[test]
+// fn test_let_cost() {
+//     let src = "(let ((a 1) (b 2)) (+ a b))";
+//     let src2 = "(let ((a 1) (b 2) (c 3)) (+ a b c))"; // should compute for 3 bindings not
+// }
 
 #[test]
 fn test_get_trait_count_direct() {
