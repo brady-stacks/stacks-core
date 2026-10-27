@@ -2085,6 +2085,17 @@ impl<'a> SortitionHandleConn<'a> {
         SortitionHandleConn::open_reader(connection, &sn.sortition_id)
     }
 
+    /// Highest arrival already scanned by this immutable sortition root.
+    pub(crate) fn get_stacks_block_max_arrival_index(&self) -> Result<u64, db_error> {
+        self.get_indexed(
+            &self.context.chain_tip,
+            &db_keys::stacks_block_max_arrival_index(),
+        )?
+        .unwrap_or_else(|| "1".into())
+        .parse()
+        .map_err(|_| db_error::Corruption)
+    }
+
     pub fn get_reward_set_size_at(&self, sortition_id: &SortitionId) -> Result<u16, db_error> {
         self.get_indexed(sortition_id, db_keys::pox_reward_set_size())
             .map(|x| {

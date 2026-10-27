@@ -819,7 +819,7 @@ pub fn open_trie_blob_readonly(conn: &Connection, block_id: u32) -> Result<Blob<
         "marf_data",
         "data",
         block_id.into(),
-        false,
+        true,
     )?;
     Ok(blob)
 }

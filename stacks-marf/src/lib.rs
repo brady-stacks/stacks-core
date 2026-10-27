@@ -54,6 +54,7 @@ pub mod bits;
 pub mod blob_layout;
 pub mod cache;
 pub mod file;
+pub mod maintenance;
 pub mod marf;
 pub mod node;
 pub mod proofs;

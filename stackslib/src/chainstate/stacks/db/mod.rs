@@ -85,6 +85,7 @@ pub mod accounts;
 pub mod blocks;
 pub mod contracts;
 pub mod headers;
+pub mod maintenance;
 pub mod snapshot;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -1087,7 +1087,7 @@ pub fn get_constant(conf: &Config, principal: &StacksAddress, contract: &str, na
     response.result().unwrap()
 }
 
-fn find_microblock_privkey(
+pub(super) fn find_microblock_privkey(
     conf: &Config,
     pubkey_hash: &Hash160,
     max_tries: u64,

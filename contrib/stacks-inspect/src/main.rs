@@ -372,6 +372,46 @@ fn main() {
     let common_opts = build_common_opts(&cli);
 
     match cli.command {
+        Command::RollbackChainstate {
+            source,
+            to_block,
+            output,
+            replay_to,
+        } => {
+            let result = stacks_inspect::chainstate::rollback(
+                &source,
+                &to_block,
+                &output,
+                replay_to.as_deref(),
+                common_opts.config.as_ref(),
+            );
+            match result {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    eprintln!("Chainstate rollback failed: {error}");
+                    process::exit(1);
+                }
+            }
+        }
+        Command::VerifyChainstate {
+            source,
+            at_block,
+            replay_to,
+        } => {
+            let result = stacks_inspect::chainstate::verify(
+                &source,
+                at_block.as_deref(),
+                replay_to.as_deref(),
+                common_opts.config.as_ref(),
+            );
+            match result {
+                Ok(report) => println!("{report}"),
+                Err(error) => {
+                    eprintln!("Chainstate verification failed: {error}");
+                    process::exit(1);
+                }
+            }
+        }
         // Decode Commands
         Command::DecodeBitcoinHeader {
             block_height,

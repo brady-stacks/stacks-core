@@ -129,6 +129,27 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Recover an exact historical block into a new node working directory (frozen source only)
+    RollbackChainstate {
+        #[arg(long)]
+        source: std::path::PathBuf,
+        #[arg(long)]
+        to_block: String,
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long)]
+        replay_to: Option<String>,
+    },
+    /// Check a private copy of a frozen network directory without publishing it
+    VerifyChainstate {
+        #[arg(long)]
+        source: std::path::PathBuf,
+        #[arg(long)]
+        at_block: Option<String>,
+        #[arg(long, requires = "at_block")]
+        replay_to: Option<String>,
+    },
+
     // ================ Decode Commands ================
     /// Decode a Bitcoin block header from SPV data
     #[command(name = "decode-bitcoin-header")]

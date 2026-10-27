@@ -1,0 +1,1 @@
+Added offline `stacks-inspect rollback-chainstate` and `verify-chainstate` commands with independent-copy recovery, retained-history checks, optional committed successor replay, and no-clobber publication.

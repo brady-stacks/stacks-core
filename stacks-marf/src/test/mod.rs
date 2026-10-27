@@ -36,6 +36,7 @@ pub mod marf_regression;
 pub mod node;
 pub mod node_patch;
 pub mod proofs;
+pub mod rewind;
 pub mod squash;
 pub mod storage;
 pub mod trie;

@@ -961,6 +961,26 @@ pub fn boot_to_epoch_3(
     self_signing: &mut Option<&mut TestSigners>,
     btc_regtest_controller: &mut BitcoinRegtestController,
 ) {
+    boot_to_epoch_3_with_hook(
+        naka_conf,
+        blocks_processed,
+        stacker_sks,
+        signer_sks,
+        self_signing,
+        btc_regtest_controller,
+        |_| {},
+    );
+}
+
+fn boot_to_epoch_3_with_hook(
+    naka_conf: &Config,
+    blocks_processed: &Arc<AtomicU64>,
+    stacker_sks: &[StacksPrivateKey],
+    signer_sks: &[StacksPrivateKey],
+    self_signing: &mut Option<&mut TestSigners>,
+    btc_regtest_controller: &mut BitcoinRegtestController,
+    before_stacking: impl FnOnce(&mut BitcoinRegtestController),
+) {
     assert_eq!(stacker_sks.len(), signer_sks.len());
 
     let epochs = naka_conf.burnchain.epochs.clone().unwrap();
@@ -987,6 +1007,13 @@ pub fn boot_to_epoch_3(
         }
         thread::sleep(Duration::from_millis(100));
     }
+    before_stacking(btc_regtest_controller);
+    run_until_burnchain_height(
+        btc_regtest_controller,
+        blocks_processed,
+        epochs[StacksEpochId::Epoch25].start_height,
+        naka_conf,
+    );
     // stack enough to activate pox-4
 
     let block_height = btc_regtest_controller.get_headers_height();
@@ -4189,11 +4216,32 @@ fn vote_for_aggregate_key_burn_op() {
 /// When `chain_id` is `Some`, both nodes run with that burnchain chain id and
 /// the test also asserts that both of them report it.
 fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_tenure: u64) {
+    follower_bootup_with_recovery(chain_id, tenure_count, inter_blocks_per_tenure, false);
+}
+
+fn follower_bootup_with_recovery(
+    chain_id: Option<u32>,
+    tenure_count: u64,
+    inter_blocks_per_tenure: u64,
+    recover: bool,
+) {
     if env::var("BITCOIND_TEST") != Ok("1".into()) {
         return;
     }
 
     let (mut naka_conf, _miner_account) = naka_neon_integration_conf(None);
+    if recover {
+        // The external CLI reads a config file, so use the same cost limits
+        // and network versions that Config::make_epochs supplies.
+        for epoch in naka_conf.burnchain.epochs.as_mut().unwrap().iter_mut() {
+            let defaults = &stacks::core::STACKS_EPOCHS_REGTEST[epoch.epoch_id];
+            epoch.block_limit = defaults.block_limit.clone();
+            epoch.network_epoch = defaults.network_epoch;
+        }
+        let epochs = naka_conf.burnchain.epochs.as_mut().unwrap();
+        epochs[StacksEpochId::Epoch24].end_height = 207;
+        epochs[StacksEpochId::Epoch25].start_height = 207;
+    }
     if let Some(chain_id) = chain_id {
         naka_conf.burnchain.chain_id = chain_id;
     }
@@ -4209,17 +4257,25 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
     let send_fee = 180;
     naka_conf.add_initial_balance(
         PrincipalData::from(sender_addr.clone()).to_string(),
-        (send_amt + send_fee) * tenure_count * inter_blocks_per_tenure,
+        (send_amt + send_fee) * tenure_count * inter_blocks_per_tenure
+            + if recover { 10_000 } else { 0 },
     );
     naka_conf.add_initial_balance(
         PrincipalData::from(sender_signer_addr.clone()).to_string(),
         100000,
     );
+    let microblock_key = recover.then(StacksPrivateKey::random);
+    if let Some(key) = &microblock_key {
+        naka_conf.add_initial_balance(tests::to_addr(key).to_string(), 100_000);
+    }
     let recipient = PrincipalData::from(StacksAddress::burn_address(false));
     let stacker_sk = setup_stacker(&mut naka_conf);
 
     test_observer::spawn();
     test_observer::register_any(&mut naka_conf);
+    if recover {
+        test_observer::register(&mut naka_conf, &[EventKeyType::MinedBlocks]);
+    }
 
     let mut btcd_controller = BitcoinCoreController::from_stx_config(&naka_conf);
     btcd_controller
@@ -4243,20 +4299,109 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
         .spawn(move || run_loop.start(None, 0))
         .unwrap();
     wait_for_runloop(&blocks_processed);
-    boot_to_epoch_3(
+    let mut microblock_tip = None;
+    boot_to_epoch_3_with_hook(
         &naka_conf,
         &blocks_processed,
         slice::from_ref(&stacker_sk),
         &[sender_signer_sk],
         &mut Some(&mut signers),
         &mut btc_regtest_controller,
+        |btc_controller| {
+            let Some(key) = &microblock_key else {
+                return;
+            };
+            // The first anchor performs the boot epoch transitions; its
+            // immediate child cannot confirm a microblock stream.
+            next_block_and_wait(btc_controller, &blocks_processed);
+            let sortdb = naka_conf.get_burnchain().open_sortition_db(false).unwrap();
+            let (chainstate, _) = StacksChainState::open(
+                false,
+                naka_conf.burnchain.chain_id,
+                &naka_conf.get_chainstate_path_str(),
+                None,
+            )
+            .unwrap();
+            microblock_tip =
+                NakamotoChainState::get_canonical_block_header(chainstate.db(), &sortdb).unwrap();
+            drop(chainstate);
+            drop(sortdb);
+            let tx = stacks::core::test_util::make_stacks_transfer_mblock_only(
+                key,
+                0,
+                1_000,
+                naka_conf.burnchain.chain_id,
+                &recipient,
+                123,
+            );
+            let parent = microblock_tip.as_ref().unwrap();
+            let stacks::chainstate::stacks::db::StacksBlockHeaderTypes::Epoch2(header) =
+                &parent.anchored_header
+            else {
+                panic!("Microblock fixture must start in epoch 2");
+            };
+            let signer = super::neon_integrations::find_microblock_privkey(
+                &naka_conf,
+                &header.microblock_pubkey_hash,
+                1024,
+            )
+            .unwrap();
+            let mut microblock = stacks::chainstate::stacks::StacksMicroblock::first_unsigned(
+                &header.block_hash(),
+                vec![StacksTransaction::consensus_deserialize(&mut tx.as_slice()).unwrap()],
+            );
+            microblock.sign(&signer).unwrap();
+            let mut bytes = Vec::new();
+            microblock.consensus_serialize(&mut bytes).unwrap();
+            let mined_before: HashSet<_> = test_observer::get_mined_blocks()
+                .into_iter()
+                .map(|block| block.block_hash)
+                .collect();
+            let commits_before = counters.neon_submitted_commits.load(Ordering::SeqCst);
+            let response = reqwest::blocking::Client::new()
+                .post(format!("{http_origin}/v2/microblocks"))
+                .header("Content-Type", "application/octet-stream")
+                .body(bytes)
+                .send()
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "Microblock admission failed: {}",
+                response.text().unwrap()
+            );
+            let url = format!(
+                "{http_origin}/v2/accounts/{}?proof=0&tip=latest",
+                tests::to_addr(key)
+            );
+            wait_for(30, || {
+                let value: serde_json::Value =
+                    reqwest::blocking::get(&url).unwrap().json().unwrap();
+                Ok(value["nonce"].as_u64() == Some(1))
+            })
+            .expect("Recovery fixture must admit its signed microblock transfer");
+            wait_for(30, || {
+                Ok(
+                    counters.neon_submitted_commits.load(Ordering::SeqCst) > commits_before
+                        && test_observer::get_mined_blocks().iter().any(|block| {
+                            block.stacks_height == parent.stacks_block_height + 1
+                                && !mined_before.contains(&block.block_hash)
+                        }),
+                )
+            })
+            .expect("Miner must build an anchor confirming the microblock");
+            next_block_and_wait(btc_controller, &blocks_processed);
+            wait_for(30, || {
+                Ok(get_account(&http_origin, &tests::to_addr(key)).nonce == 1)
+            })
+            .expect("Epoch-2 anchor must confirm the microblock transfer");
+        },
     );
 
     info!("Bootstrapped to Epoch-3.0 boundary, starting nakamoto miner");
 
     let burnchain = naka_conf.get_burnchain();
     let sortdb = burnchain.open_sortition_db(true).unwrap();
-    let (chainstate, _) = StacksChainState::open(
+    let (mut chainstate, _) = StacksChainState::open(
         naka_conf.is_mainnet(),
         naka_conf.burnchain.chain_id,
         &naka_conf.get_chainstate_path_str(),
@@ -4269,6 +4414,10 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
             .unwrap()
             .unwrap()
             .stacks_block_height;
+    let epoch_2_tip = NakamotoChainState::get_canonical_block_header(chainstate.db(), &sortdb)
+        .unwrap()
+        .unwrap();
+    let mut interior_tip = None;
 
     info!("Nakamoto miner started...");
     blind_signer(&naka_conf, &signers, &counters);
@@ -4281,6 +4430,13 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
     follower_conf.node.working_dir = format!("{}-follower", &naka_conf.node.working_dir);
     follower_conf.node.seed = vec![0x01; 32];
     follower_conf.node.local_peer_seed = vec![0x02; 32];
+    if recover {
+        // This follower misses the miner/control's intended 3.1 upgrade at 241.
+        // It will process the burnchain suffix under the obsolete schedule.
+        let epochs = follower_conf.burnchain.epochs.as_mut().unwrap();
+        epochs[StacksEpochId::Epoch30].end_height = 243;
+        epochs[StacksEpochId::Epoch31].start_height = 243;
+    }
 
     let rpc_port = gen_random_port();
     let p2p_port = gen_random_port();
@@ -4339,7 +4495,7 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
         debug!("follower_bootup: Miner mines interum blocks for tenure {tenure_ix}");
 
         // mine the interim blocks
-        for _ in 0..inter_blocks_per_tenure {
+        for interim_ix in 0..inter_blocks_per_tenure {
             let blocks_processed_before = coord_channel
                 .lock()
                 .expect("Mutex poisoned")
@@ -4358,14 +4514,27 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
             let sender_nonce = account
                 .nonce
                 .max(last_nonce.as_ref().map(|ln| *ln + 1).unwrap_or(0));
-            let transfer_tx = make_stacks_transfer_serialized(
-                &sender_sk,
-                sender_nonce,
-                send_fee,
-                naka_conf.burnchain.chain_id,
-                &recipient,
-                send_amt,
-            );
+            let transfer_tx = if recover
+                && tenure_ix + 1 == tenure_count
+                && interim_ix + 1 == inter_blocks_per_tenure
+            {
+                // Deploy after the interior rollback target. Explicit replay
+                // must execute this again, without discarded metadata rows.
+                make_contract_publish(
+                    &sender_sk, sender_nonce, 10_000, naka_conf.burnchain.chain_id,
+                    "recovery-probe",
+                    "(define-data-var saved uint u42) (define-read-only (read-saved) (var-get saved))",
+                )
+            } else {
+                make_stacks_transfer_serialized(
+                    &sender_sk,
+                    sender_nonce,
+                    send_fee,
+                    naka_conf.burnchain.chain_id,
+                    &recipient,
+                    send_amt,
+                )
+            };
             submit_tx(&http_origin, &transfer_tx);
 
             last_nonce = Some(sender_nonce);
@@ -4416,6 +4585,13 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
                 Ok(true)
             })
             .expect("Timed out waiting for the miner to mine an interim block");
+            if recover && tenure_ix == 0 && interior_tip.is_none() {
+                interior_tip = Some(
+                    NakamotoChainState::get_canonical_block_header(chainstate.db(), &sortdb)
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
         }
 
         debug!("follower_bootup: Wait for next block-commit");
@@ -4469,6 +4645,58 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
         assert_eq!(get_chain_info(&follower_conf).network_id, chain_id);
     }
 
+    if recover {
+        // Leave the obsolete-schedule follower running while the upgraded miner
+        // crosses 3.1. Its burn/sortition suffix must be discarded and evaluated
+        // again, even if it cannot accept the upgraded miner's Stacks blocks.
+        let boundary =
+            naka_conf.burnchain.epochs.as_ref().unwrap()[StacksEpochId::Epoch31].start_height;
+        while get_chain_info(&naka_conf).burn_block_height <= boundary {
+            next_block_and_mine_commit(&btc_regtest_controller, 60, &naka_conf, &counters).unwrap();
+        }
+        wait_for(120, || {
+            Ok(get_chain_info_result(&follower_conf)
+                .map(|info| info.burn_block_height > boundary)
+                .unwrap_or(false))
+        })
+        .expect("Obsolete-schedule source must process burn blocks past the missed upgrade");
+        let upgraded_tip = NakamotoChainState::get_canonical_block_header(chainstate.db(), &sortdb)
+            .unwrap()
+            .unwrap();
+        let id = upgraded_tip.index_block_hash();
+        assert_eq!(
+            chainstate.with_read_only_clarity_tx(
+                &sortdb.index_handle_at_block(&chainstate, &id).unwrap(),
+                &id,
+                |conn| conn.with_clarity_db_readonly(|db| db.get_clarity_epoch_version().unwrap()),
+            ),
+            Some(StacksEpochId::Epoch31)
+        );
+        // Fully close every follower writer before either hashing it or invoking the CLI.
+        follower_coord_channel
+            .lock()
+            .unwrap()
+            .stop_chains_coordinator();
+        follower_run_loop_stopper.store(false, Ordering::SeqCst);
+        follower_thread.join().unwrap();
+        recover_follower_from_cli(
+            &follower_conf,
+            &naka_conf,
+            &epoch_2_tip,
+            &interior_tip.expect("Recovery needs an interior Nakamoto block"),
+            &upgraded_tip,
+            &tip,
+            &sender_addr,
+            &microblock_tip.expect("Recovery needs an epoch-2 microblock parent"),
+            &tests::to_addr(microblock_key.as_ref().unwrap()),
+            boundary,
+        );
+        coord_channel.lock().unwrap().stop_chains_coordinator();
+        run_loop_stopper.store(false, Ordering::SeqCst);
+        run_loop_thread.join().unwrap();
+        return;
+    }
+
     coord_channel
         .lock()
         .expect("Mutex poisoned")
@@ -4483,6 +4711,667 @@ fn follower_bootup(chain_id: Option<u32>, tenure_count: u64, inter_blocks_per_te
 
     run_loop_thread.join().unwrap();
     follower_thread.join().unwrap();
+}
+
+/// Build with `cargo build -p stacks-inspect --features stackslib/testing` so
+/// coinbase maturity matches this fixture. STACKS_INSPECT_BIN overrides the binary.
+/// Never invoke Cargo from a test.
+#[test]
+#[ignore]
+fn follower_chainstate_cli_recovery() {
+    follower_bootup_with_recovery(None, 2, 3, true);
+}
+
+fn recover_follower_from_cli(
+    source_conf: &Config,
+    control_conf: &Config,
+    epoch_2_tip: &StacksHeaderInfo,
+    interior_tip: &StacksHeaderInfo,
+    control_tip: &StacksHeaderInfo,
+    replay_tip: &StacksHeaderInfo,
+    sender: &StacksAddress,
+    microblock_tip: &StacksHeaderInfo,
+    microblock_sender: &StacksAddress,
+    upgraded_boundary: u64,
+) {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    assert!(epoch_2_tip.anchored_header.as_stacks_nakamoto().is_none());
+    assert!(interior_tip.stacks_block_height > epoch_2_tip.stacks_block_height + 1);
+    assert!(interior_tip.stacks_block_height < control_tip.stacks_block_height);
+
+    fn hashes(root: &Path) -> BTreeMap<PathBuf, Sha512Trunc256Sum> {
+        fn visit(root: &Path, dir: &Path, entries: &mut BTreeMap<PathBuf, Sha512Trunc256Sum>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, entries);
+                } else {
+                    entries.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        Sha512Trunc256Sum::from_data(&std::fs::read(&path).unwrap()),
+                    );
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    let source = source_conf
+        .get_chainstate_path()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let output_parent = source.parent().unwrap().parent().unwrap();
+    let output_stem = source_conf.node.working_dir.rsplit('/').next().unwrap();
+    let source_burnchain = source_conf.get_burnchain();
+    let source_sortdb = source_burnchain.open_sortition_db(false).unwrap();
+    assert!(
+        SortitionDB::get_canonical_burn_chain_tip(source_sortdb.conn())
+            .unwrap()
+            .block_height
+            > upgraded_boundary
+    );
+    assert_eq!(
+        SortitionDB::get_stacks_epoch(source_sortdb.conn(), upgraded_boundary)
+            .unwrap()
+            .unwrap()
+            .epoch_id,
+        StacksEpochId::Epoch30
+    );
+    drop(source_sortdb);
+    let executable = env::var_os("STACKS_INSPECT_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/stacks-inspect")
+        });
+    assert!(
+        executable.is_file(),
+        "Build stacks-inspect first or set STACKS_INSPECT_BIN"
+    );
+
+    // The inspect process must use this fixture's actual epoch and PoX schedule,
+    // not the built-in regtest defaults.
+    let config_path = PathBuf::from(format!("{}-recovery.toml", source_conf.node.working_dir));
+    let mut config = format!(
+        "[node]\nworking_dir = {:?}\n[burnchain]\nmode = {:?}\nchain_id = {}\n\
+         magic_bytes = \"T3\"\npox_prepare_length = {}\npox_reward_length = {}\n",
+        source_conf.node.working_dir,
+        source_conf.burnchain.mode,
+        source_conf.burnchain.chain_id,
+        source_conf.burnchain.pox_prepare_length.unwrap(),
+        source_conf.burnchain.pox_reward_length.unwrap(),
+    );
+    for epoch in control_conf.burnchain.epochs.as_ref().unwrap().iter() {
+        config.push_str(&format!(
+            "[[burnchain.epochs]]\nepoch_name = \"{}\"\nstart_height = {}\n",
+            epoch.epoch_id,
+            epoch.start_height.min(i64::MAX as u64),
+        ));
+    }
+    for balance in &source_conf.initial_balances {
+        config.push_str(&format!(
+            "[[ustx_balance]]\naddress = \"{}\"\namount = {}\n",
+            balance.address, balance.amount,
+        ));
+    }
+    std::fs::write(&config_path, config).unwrap();
+
+    let control_origin = format!("http://{}", control_conf.node.rpc_bind);
+    let expected_account = get_account(&control_origin, sender);
+    let expected_microblock_account = get_account(&control_origin, microblock_sender);
+    assert_eq!(expected_microblock_account.nonce, 1);
+    assert_eq!(expected_microblock_account.balance, 98_877);
+    assert_eq!(
+        call_read_only(control_conf, sender, "recovery-probe", "read-saved", vec![])
+            .result()
+            .unwrap(),
+        Value::UInt(42),
+    );
+    let burnchain = control_conf.get_burnchain();
+    let first_cycle = burnchain
+        .block_height_to_reward_cycle(
+            control_conf.burnchain.epochs.as_ref().unwrap()[StacksEpochId::Epoch30].start_height,
+        )
+        .unwrap();
+    let expected_rewards = get_stacker_set(&control_origin, first_cycle)
+        .unwrap()
+        .stacker_set;
+    assert!(!expected_rewards.signers().unwrap().is_empty());
+    // The first Nakamoto reward set is calculated in epoch 2. Removing it makes
+    // restarting at either boundary unable to validate the first tenure.
+    let source_index = Connection::open_with_flags(
+        source.join("chainstate/vm/index.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let early_rewards: Vec<(String, String)> = source_index
+        .prepare(
+            "SELECT r.index_block_hash, r.reward_set FROM nakamoto_reward_sets r \
+         JOIN block_headers h ON h.index_block_hash = r.index_block_hash \
+         WHERE h.block_height <= ?1 ORDER BY r.index_block_hash",
+        )
+        .unwrap()
+        .query_map([epoch_2_tip.stacks_block_height], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        !early_rewards.is_empty(),
+        "Fixture must exercise epoch-2-calculated Nakamoto rewards"
+    );
+    drop(source_index);
+    let before = hashes(&source);
+    // Each corruption starts from an independently recovered publication, so a
+    // rejection cannot be caused by damage left by a preceding negative case.
+    for label in ["metadata", "first-cycle-rewards"] {
+        let output = output_parent.join(format!("{output_stem}-corrupt-{label}"));
+        let result = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("rollback-chainstate")
+            .arg("--source")
+            .arg(&source)
+            .arg("--to-block")
+            .arg(interior_tip.index_block_hash().to_string())
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "Negative-case recovery failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let published = output.join(&source_conf.burnchain.mode);
+        let baseline = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("verify-chainstate")
+            .arg("--source")
+            .arg(&published)
+            .output()
+            .unwrap();
+        assert!(
+            baseline.status.success(),
+            "Uncorrupted {label} publication must verify: {}",
+            String::from_utf8_lossy(&baseline.stderr)
+        );
+        if label == "metadata" {
+            let db = Connection::open(published.join("chainstate/vm/clarity/marf.sqlite")).unwrap();
+            let removed = db
+                .execute(
+                    "DELETE FROM metadata_table WHERE key LIKE 'clr-meta::%.pox-4::%'",
+                    [],
+                )
+                .unwrap();
+            assert!(removed > 0, "Must delete retained PoX-4 contract metadata");
+        } else {
+            let db = Connection::open(published.join("chainstate/vm/index.sqlite")).unwrap();
+            for (id, _) in &early_rewards {
+                assert_eq!(
+                    db.execute(
+                        "DELETE FROM nakamoto_reward_sets WHERE index_block_hash = ?1",
+                        [id],
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+        let corrupted_before = hashes(&published);
+        let result = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("verify-chainstate")
+            .arg("--source")
+            .arg(&published)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "verify-chainstate accepted missing {label}"
+        );
+        assert_eq!(
+            corrupted_before,
+            hashes(&published),
+            "Verification must not change its input"
+        );
+        assert_eq!(
+            before,
+            hashes(&source),
+            "Negative CLI case must leave source unchanged"
+        );
+    }
+    let mut publications = Vec::new();
+    // Model the three independent production commit windows by overlaying
+    // newer complete stores onto an otherwise healthy older publication.
+    for (window, stores) in [
+        ("clarity", vec!["chainstate/vm/clarity/marf.sqlite"]),
+        (
+            "index",
+            vec![
+                "chainstate/vm/clarity/marf.sqlite",
+                "chainstate/vm/index.sqlite",
+            ],
+        ),
+        (
+            "staging",
+            vec![
+                "chainstate/vm/clarity/marf.sqlite",
+                "chainstate/vm/index.sqlite",
+                "chainstate/blocks/nakamoto.sqlite",
+            ],
+        ),
+    ] {
+        let candidate = output_parent.join(format!("{output_stem}-window-{window}"));
+        let recovered = output_parent.join(format!("{output_stem}-window-{window}-recovered"));
+        let result = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("rollback-chainstate")
+            .arg("--source")
+            .arg(&source)
+            .arg("--to-block")
+            .arg(interior_tip.index_block_hash().to_string())
+            .arg("--output")
+            .arg(&candidate)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "Cannot prepare {window} commit window: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let candidate_network = candidate.join(&source_conf.burnchain.mode);
+        for store in stores {
+            // SQLite journals/WAL/SHM and MARF .blobs belong to their store.
+            // Remove older companions even when the newer store has none.
+            for suffix in ["", ".blobs", "-wal", "-shm", "-journal"] {
+                let relative = format!("{store}{suffix}");
+                let destination = candidate_network.join(&relative);
+                if destination.exists() {
+                    std::fs::remove_file(&destination).unwrap();
+                }
+                let newer = source.join(relative);
+                if newer.exists() {
+                    std::fs::copy(newer, destination).unwrap();
+                }
+            }
+        }
+        let candidate_before = hashes(&candidate_network);
+        if window == "clarity" {
+            let result = Command::new(&executable)
+                .arg("--config")
+                .arg(&config_path)
+                .arg("verify-chainstate")
+                .arg("--source")
+                .arg(&candidate_network)
+                .output()
+                .unwrap();
+            assert!(
+                !result.status.success(),
+                "Current-state verification accepted an unfinished Clarity commit"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("has no committed header"));
+        }
+        let result = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("rollback-chainstate")
+            .arg("--source")
+            .arg(&candidate_network)
+            .arg("--to-block")
+            .arg(interior_tip.index_block_hash().to_string())
+            .arg("--output")
+            .arg(&recovered)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "Cannot recover {window} commit window: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let publication = recovered.join(&source_conf.burnchain.mode);
+        let result = Command::new(&executable)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("verify-chainstate")
+            .arg("--source")
+            .arg(&publication)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "Cannot verify {window} commit window: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let index = Connection::open_with_flags(
+            publication.join("chainstate/vm/index.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let target: String = index.query_row(
+            "SELECT index_block_hash FROM nakamoto_block_headers ORDER BY block_height DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(target, interior_tip.index_block_hash().to_string());
+        assert_eq!(
+            candidate_before,
+            hashes(&candidate_network),
+            "Commit-window input changed"
+        );
+        assert_eq!(
+            before,
+            hashes(&source),
+            "Commit-window recovery changed original source"
+        );
+        publications.push((window, interior_tip, false, recovered));
+    }
+    let rejected_output = output_parent.join(format!("{output_stem}-unknown-replay"));
+    let result = Command::new(&executable)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("rollback-chainstate")
+        .arg("--source")
+        .arg(&source)
+        .arg("--to-block")
+        .arg(interior_tip.index_block_hash().to_string())
+        .arg("--replay-to")
+        .arg("fe".repeat(32))
+        .arg("--output")
+        .arg(&rejected_output)
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "Unknown requested replay must reject publication"
+    );
+    assert!(
+        !rejected_output.exists(),
+        "Failed replay must not publish a final output"
+    );
+    assert_eq!(
+        before,
+        hashes(&source),
+        "Rejected replay must leave source byte-identical"
+    );
+
+    let missing_stream = output_parent.join(format!("{output_stem}-missing-stream"));
+    for relative in before.keys() {
+        let destination = missing_stream.join(relative);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(source.join(relative), destination).unwrap();
+    }
+    let db = Connection::open(missing_stream.join("chainstate/vm/index.sqlite")).unwrap();
+    let tail: String = db
+        .query_row(
+            "SELECT parent_microblock FROM block_headers WHERE parent_block_id = ?1",
+            [microblock_tip.index_block_hash()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        db.execute(
+            "DELETE FROM staging_microblocks_data WHERE block_hash = ?1",
+            [&tail]
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    let missing_before = hashes(&missing_stream);
+    let rejected = output_parent.join(format!("{output_stem}-missing-stream-output"));
+    let result = Command::new(&executable)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("rollback-chainstate")
+        .arg("--source")
+        .arg(&missing_stream)
+        .arg("--to-block")
+        .arg(microblock_tip.index_block_hash().to_string())
+        .arg("--replay-to")
+        .arg(replay_tip.index_block_hash().to_string())
+        .arg("--output")
+        .arg(&rejected)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Missing confirmed microblock"));
+    assert!(!rejected.exists());
+    assert_eq!(missing_before, hashes(&missing_stream));
+
+    publications.extend(
+        [
+            ("interior", interior_tip, false),
+            ("epoch2", epoch_2_tip, true),
+            ("microblocks", microblock_tip, true),
+            ("hardfork", interior_tip, false),
+        ]
+        .map(|(label, target, replay)| {
+            (
+                label,
+                target,
+                replay,
+                output_parent.join(format!("{output_stem}-recovered-{label}")),
+            )
+        }),
+    );
+    for (label, target, replay, output) in publications {
+        if !output.exists() {
+            let mut command = Command::new(&executable);
+            command
+                .arg("--config")
+                .arg(&config_path)
+                .arg("rollback-chainstate")
+                .arg("--source")
+                .arg(&source)
+                .arg("--to-block")
+                .arg(target.index_block_hash().to_string())
+                .arg("--output")
+                .arg(&output);
+            if replay {
+                command
+                    .arg("--replay-to")
+                    .arg(replay_tip.index_block_hash().to_string());
+            }
+            let result = command.output().expect("Unable to run stacks-inspect");
+            assert!(
+                result.status.success(),
+                "CLI recovery {label} failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+            if replay {
+                assert!(
+                    String::from_utf8_lossy(&result.stdout).contains("(committed and reopened)"),
+                    "CLI must report committed replay, not storage-only verification",
+                );
+            }
+        }
+        assert_eq!(
+            before,
+            hashes(&source),
+            "CLI must not alter the stopped source"
+        );
+        let published = output.join(&source_conf.burnchain.mode);
+        let recovered_index = Connection::open_with_flags(
+            published.join("chainstate/vm/index.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (id, rewards) in early_rewards
+            .iter()
+            .filter(|_| target.stacks_block_height >= epoch_2_tip.stacks_block_height)
+        {
+            let retained: String = recovered_index
+                .query_row(
+                    "SELECT reward_set FROM nakamoto_reward_sets WHERE index_block_hash = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("Recovery discarded the first Nakamoto reward cycle");
+            assert_eq!(&retained, rewards);
+        }
+        // Requested replay runs on a disposable probe, never advances publication.
+        let published_id: String = recovered_index
+            .query_row(
+                "SELECT index_block_hash FROM (\
+             SELECT index_block_hash, block_height FROM block_headers UNION ALL \
+             SELECT index_block_hash, block_height FROM nakamoto_block_headers) \
+             ORDER BY block_height DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(published_id, target.index_block_hash().to_string());
+        drop(recovered_index);
+        let published_clarity = Connection::open_with_flags(
+            published.join("chainstate/vm/clarity/marf.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let discarded_metadata: u64 = published_clarity.query_row(
+            "SELECT COUNT(*) FROM metadata_table WHERE key LIKE 'clr-meta::%.recovery-probe::%'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            discarded_metadata, 0,
+            "Discarded deployment metadata survived rollback"
+        );
+        drop(published_clarity);
+        let published_burnchain = Connection::open_with_flags(
+            published.join("burnchain/sortition/marf.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let max_height: u64 = published_burnchain
+            .query_row("SELECT MAX(block_height) FROM snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            max_height < upgraded_boundary,
+            "Obsolete-schedule sortitions must be removed"
+        );
+        drop(published_burnchain);
+
+        let mut recovered_conf = source_conf.clone();
+        recovered_conf.node.working_dir = output.to_str().unwrap().to_owned();
+        recovered_conf.burnchain.epochs = control_conf.burnchain.epochs.clone();
+        if label == "hardfork" {
+            let original = source_conf.burnchain.epochs.as_ref().unwrap();
+            let intended = control_conf.burnchain.epochs.as_ref().unwrap();
+            assert_ne!(
+                original[StacksEpochId::Epoch31].start_height,
+                intended[StacksEpochId::Epoch31].start_height
+            );
+            assert!(
+                interior_tip.burn_header_height
+                    < intended[StacksEpochId::Epoch31].start_height as u32
+            );
+            assert!(
+                control_tip.burn_header_height
+                    >= intended[StacksEpochId::Epoch31].start_height as u32
+            );
+        }
+        let mut recovered = boot_nakamoto::BootRunLoop::new(recovered_conf.clone()).unwrap();
+        let stopper = recovered.get_termination_switch();
+        let coordinator = recovered.coordinator_channels();
+        let handle = thread::spawn(move || recovered.start(None, 0));
+        wait_for(120, || {
+            let Ok(info) = get_chain_info_result(&recovered_conf) else {
+                return Ok(false);
+            };
+            Ok(info.stacks_tip == control_tip.anchored_header.block_hash()
+                && info.stacks_tip_consensus_hash == control_tip.consensus_hash)
+        })
+        .expect("Recovered normal follower did not reach the control tip");
+        let origin = format!("http://{}", recovered_conf.node.rpc_bind);
+        let account = get_account(&origin, sender);
+        assert_eq!(account.nonce, expected_account.nonce);
+        assert_eq!(account.balance, expected_account.balance);
+        let microblock_account = get_account(&origin, microblock_sender);
+        assert_eq!(microblock_account.nonce, expected_microblock_account.nonce);
+        assert_eq!(
+            microblock_account.balance,
+            expected_microblock_account.balance
+        );
+        assert_eq!(
+            call_read_only(
+                &recovered_conf,
+                sender,
+                "recovery-probe",
+                "read-saved",
+                vec![]
+            )
+            .result()
+            .unwrap(),
+            Value::UInt(42),
+        );
+        assert_eq!(
+            call_read_only(control_conf, sender, "recovery-probe", "read-saved", vec![])
+                .result()
+                .unwrap(),
+            Value::UInt(42),
+        );
+        assert_eq!(
+            get_stacker_set(&origin, first_cycle)
+                .unwrap()
+                .stacker_set
+                .metadata_serialize(),
+            expected_rewards.metadata_serialize(),
+        );
+        coordinator.lock().unwrap().stop_chains_coordinator();
+        stopper.store(false, Ordering::SeqCst);
+        handle.join().unwrap();
+        let recovered_burnchain = recovered_conf.get_burnchain();
+        let sortdb = recovered_burnchain.open_sortition_db(false).unwrap();
+        let (mut chainstate, _) = StacksChainState::open(
+            recovered_conf.is_mainnet(),
+            recovered_conf.burnchain.chain_id,
+            &recovered_conf.get_chainstate_path_str(),
+            None,
+        )
+        .unwrap();
+        let tip = NakamotoChainState::get_canonical_block_header(chainstate.db(), &sortdb)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tip.index_block_hash(), control_tip.index_block_hash());
+        assert_eq!(tip.index_root, control_tip.index_root);
+        assert_eq!(
+            tip.anchored_header
+                .as_stacks_nakamoto()
+                .unwrap()
+                .state_index_root,
+            control_tip
+                .anchored_header
+                .as_stacks_nakamoto()
+                .unwrap()
+                .state_index_root,
+        );
+        if label == "hardfork" {
+            let id = tip.index_block_hash();
+            let epoch = chainstate.with_read_only_clarity_tx(
+                &sortdb.index_handle_at_block(&chainstate, &id).unwrap(),
+                &id,
+                |conn| conn.with_clarity_db_readonly(|db| db.get_clarity_epoch_version().unwrap()),
+            );
+            assert_eq!(epoch, Some(StacksEpochId::Epoch31));
+        }
+        assert_eq!(
+            before,
+            hashes(&source),
+            "Normal restart must leave the source untouched"
+        );
+    }
+    std::fs::remove_file(config_path).unwrap();
 }
 
 /// This test boots a follower node using the block downloader

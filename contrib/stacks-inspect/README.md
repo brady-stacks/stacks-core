@@ -19,6 +19,89 @@ cargo build -p stacks-inspect
 
 ## Commands
 
+### Offline chainstate recovery
+
+```bash
+stacks-inspect --config node.toml rollback-chainstate \
+  --source /snapshot/mainnet --to-block <64-hex-block-id> \
+  --output /recovery/new-working-dir [--replay-to <successor-block-id>]
+
+stacks-inspect --config node.toml verify-chainstate --source /snapshot/mainnet
+
+stacks-inspect --config node.toml verify-chainstate \
+  --source /snapshot/mainnet --at-block <64-hex-block-id> \
+  --replay-to <successor-block-id>
+```
+
+`--source` is the **network directory**, containing `chainstate/`,
+`burnchain/`, and `headers.sqlite`, not the node working directory above it.
+`--output` names a **new working directory**; its parent must already exist.
+For example, with mainnet configuration, recovered files are placed at
+`/recovery/new-working-dir/mainnet/`. Point the normal node's `working_dir` at
+`/recovery/new-working-dir`, not its `mainnet` child.
+
+Explicit `--config` or `--network-config` selection is required. Use the intended
+node binary's actual network, PoX, and epoch configuration. To recover from a
+missed hard fork, select a boundary **before** the first divergent burn block;
+changing the epoch schedule does not repair already-evaluated consensus results.
+The tool does not downgrade persisted schemas to impersonate an older binary.
+Unsupported schemas, missing required history, and targets below a required
+MARF history floor are errors, not permission to choose a different target.
+
+**Stop the source node first, or use a coherent filesystem snapshot.**
+Live copying is unsupported. An `lsof` check rejects detected open files when
+available, and file-size/modification-time checks detect some changes during
+copying. Neither is cross-process locking or proof of a coherent snapshot.
+The operator must keep the source frozen for the entire operation, including
+optional replay. All database opens, recovery, and writes take place on private
+copies; the acquisition layer only reads source files.
+
+Acquisition copies independent bytes for the Clarity/index stores under
+`chainstate/vm/`, block payloads and Nakamoto staging under `chainstate/blocks/`,
+the sortition store, `burnchain/burnchain.sqlite`, and `headers.sqlite`, including
+their WAL, journal, shared-memory, and blob companions when present.
+Unclassified files within consensus-store directories are rejected. Mempool,
+peer, fee-estimator, Atlas, StackerDB, and signer-local state are not copied.
+Signer safety databases and external consumers are **not rewound or reset**.
+Normal startup is responsible for creating its optional local stores.
+
+The command reports artifact bytes and available destination space before
+copying. Allow room for a full independent copy, SQLite recovery and writes;
+optional replay requires a second disposable copy. Verification-only copies
+use the system temporary directory. There are no hard-link shortcuts or
+automatic downloads.
+
+Storage-only success explicitly reports **“Progression: not tested.”**
+`--at-block` checks a projected recovered prefix; it does not establish that the
+source's current tips were consistent. `--replay-to` requires an explicit
+`--at-block` for verification and must have every required successor payload
+and burnchain input available in the frozen source. Requested replay runs on a
+second disposable copy, must commit through the exact endpoint and reopen
+successfully, and gates rollback publication. The published candidate remains
+at `--to-block`, not the replay endpoint. Missing inputs or any requested check
+failure return nonzero. Neither storage consistency nor a finite replay range
+authenticates a snapshot or guarantees future live-network liveness.
+
+On Linux and macOS, publication checkpoints SQLite, flushes candidate files and
+directories, then uses a same-filesystem atomic **no-clobber** directory rename.
+Existing destinations, source/output nesting, symlink paths, and symlink
+artifacts are rejected. The output is never an automatic replacement for an
+active node directory. Ordinary failures remove unpublished copies; abrupt
+termination can leave clearly named `.stacks-recovery-partial-*` directories,
+which are not resumable outputs. Remove such abandoned copies only after
+confirming that no recovery process is using them. Atomic publication on other
+platforms is unsupported.
+
+Catch-up can emit duplicate events. Coordinate indexer/event-consumer recovery
+separately and preserve signer safety state according to its own operational
+requirements. A successful offline check is not a claim that an actual node
+restart and live catch-up have already been exercised.
+
+The bitcoind-backed recovery regression uses the test coinbase-maturity rules.
+Build its CLI with `cargo build -p stacks-inspect --features stackslib/testing`,
+then run `BITCOIND_TEST=1 cargo test -p stacks-node follower_chainstate_cli_recovery -- --ignored`
+with `bitcoind` on `PATH`. Do not use that test-feature binary for production recovery.
+
 ### Decode Commands
 
 Decode and inspect Bitcoin/Stacks primitives.

@@ -24,14 +24,14 @@
 //!
 //! Detectable violations surface as `CorruptionError`s.
 
-mod blocks;
-mod burnchain;
-mod clarity;
+pub(crate) mod blocks;
+pub(crate) mod burnchain;
+pub(crate) mod clarity;
 mod common;
 mod fork_storage;
-mod index;
-mod sortition;
-mod spv;
+pub(crate) mod index;
+pub(crate) mod sortition;
+pub(crate) mod spv;
 
 #[cfg(test)]
 mod tests;

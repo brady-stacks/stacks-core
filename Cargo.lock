@@ -4505,6 +4505,7 @@ dependencies = [
  "clap",
  "clarity 0.0.1",
  "clarity-cli",
+ "libc",
  "libstackerdb 0.0.1",
  "mutants",
  "regex",
