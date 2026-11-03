@@ -31,6 +31,66 @@ use crate::vm::representations::SymbolicExpression;
 use crate::vm::types::{QualifiedContractIdentifier, Value};
 use crate::vm::{ExecutionResult, ValueRef};
 
+/// Shared, optional sink for rollback-aware state observations.
+pub type SharedStateObserver = std::rc::Rc<std::cell::RefCell<dyn StateObserver>>;
+
+/// Concrete storage namespace and key being mutated.
+#[derive(Debug, Clone, Copy)]
+pub enum StateKey<'a> {
+    /// Consensus key-value data.
+    Data(&'a str),
+    /// Contract metadata, scoped independently from consensus data.
+    Metadata {
+        /// Contract owning the metadata.
+        contract: &'a QualifiedContractIdentifier,
+        /// Canonical metadata key.
+        key: &'a str,
+    },
+}
+
+/// A mutation or rollback-frame transition, in execution order.
+#[derive(Debug)]
+pub enum StateEvent<'a> {
+    /// A rollback frame opened.
+    Nest {
+        /// Stable identifier within the attached observation.
+        frame_id: u64,
+        /// Enclosing rollback frame, if any.
+        parent_id: Option<u64>,
+    },
+    /// A frame committed into its parent or backing store.
+    Commit {
+        /// Frame that committed.
+        frame_id: u64,
+        /// Parent receiving the edits, if any.
+        parent_id: Option<u64>,
+    },
+    /// A frame's edits were discarded.
+    Rollback {
+        /// Frame that rolled back.
+        frame_id: u64,
+        /// Enclosing frame, if any.
+        parent_id: Option<u64>,
+    },
+    /// A successful write to the pending rollback log.
+    Write {
+        /// Frame owning this write.
+        frame_id: u64,
+        /// Actual canonical storage key.
+        key: StateKey<'a>,
+        /// Visible value before the write; an error explicitly marks an incomplete trace.
+        before: Result<Option<&'a str>, &'a VmExecutionError>,
+        /// Actual serialized value stored by this write.
+        after: &'a str,
+    },
+}
+
+/// Receives state mutations without changing VM execution outcomes.
+pub trait StateObserver {
+    /// Observe one event synchronously; borrowed values are valid only during this call.
+    fn observe(&mut self, event: StateEvent<'_>);
+}
+
 // NOTE: Used in the Clarinet repo.
 /// Defines the contract for receiving notifications about Clarity evaluation and callable
 /// invocation.

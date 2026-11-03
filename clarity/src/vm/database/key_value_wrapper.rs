@@ -26,6 +26,7 @@ use super::{ClarityBackingStore, ClarityDeserializable};
 use crate::vm::Value;
 use crate::vm::database::clarity_store::{ContractCommitment, make_contract_hash_key};
 use crate::vm::errors::{VmExecutionError, VmInternalError};
+use crate::vm::hooks::{SharedStateObserver, StateEvent, StateKey};
 use crate::vm::types::serialization::SerializationError;
 use crate::vm::types::{QualifiedContractIdentifier, TypeSignature};
 
@@ -111,6 +112,7 @@ pub struct ValueResult {
 pub struct RollbackContext {
     edits: Vec<(String, RollbackValueCheck)>,
     metadata_edits: Vec<((QualifiedContractIdentifier, String), RollbackValueCheck)>,
+    frame_id: u64,
 }
 
 pub struct RollbackWrapper<'a> {
@@ -130,6 +132,8 @@ pub struct RollbackWrapper<'a> {
     //   to indicate a given contexts "start depth".
     stack: Vec<RollbackContext>,
     query_pending_data: bool,
+    observer: Option<SharedStateObserver>,
+    next_frame_id: u64,
 }
 
 // This is used for preserving rollback data longer
@@ -140,6 +144,8 @@ pub struct RollbackWrapperPersistedLog {
     lookup_map: HashMap<String, Vec<String>>,
     metadata_lookup_map: HashMap<(QualifiedContractIdentifier, String), Vec<String>>,
     stack: Vec<RollbackContext>,
+    observer: Option<SharedStateObserver>,
+    next_frame_id: u64,
 }
 
 impl From<RollbackWrapper<'_>> for RollbackWrapperPersistedLog {
@@ -148,6 +154,8 @@ impl From<RollbackWrapper<'_>> for RollbackWrapperPersistedLog {
             lookup_map: o.lookup_map,
             metadata_lookup_map: o.metadata_lookup_map,
             stack: o.stack,
+            observer: o.observer,
+            next_frame_id: o.next_frame_id,
         }
     }
 }
@@ -164,13 +172,17 @@ impl RollbackWrapperPersistedLog {
             lookup_map: HashMap::new(),
             metadata_lookup_map: HashMap::new(),
             stack: Vec::new(),
+            observer: None,
+            next_frame_id: 1,
         }
     }
 
     pub fn nest(&mut self) {
+        let frame_id = open_observed_frame(&self.observer, &mut self.next_frame_id, &self.stack);
         self.stack.push(RollbackContext {
             edits: Vec::new(),
             metadata_edits: Vec::new(),
+            frame_id,
         });
     }
 }
@@ -202,6 +214,23 @@ where
     Ok(popped_value)
 }
 
+fn open_observed_frame(
+    observer: &Option<SharedStateObserver>,
+    next_frame_id: &mut u64,
+    stack: &[RollbackContext],
+) -> u64 {
+    let Some(observer) = observer else {
+        return 0;
+    };
+    let frame_id = *next_frame_id;
+    *next_frame_id += 1;
+    observer.borrow_mut().observe(StateEvent::Nest {
+        frame_id,
+        parent_id: stack.last().map(|frame| frame.frame_id),
+    });
+    frame_id
+}
+
 impl<'a> RollbackWrapper<'a> {
     pub fn new(store: &'a mut dyn ClarityBackingStore) -> RollbackWrapper<'a> {
         RollbackWrapper {
@@ -210,6 +239,8 @@ impl<'a> RollbackWrapper<'a> {
             metadata_lookup_map: HashMap::new(),
             stack: Vec::new(),
             query_pending_data: true,
+            observer: None,
+            next_frame_id: 1,
         }
     }
 
@@ -223,6 +254,25 @@ impl<'a> RollbackWrapper<'a> {
             metadata_lookup_map: log.metadata_lookup_map,
             stack: log.stack,
             query_pending_data: true,
+            observer: log.observer,
+            next_frame_id: log.next_frame_id,
+        }
+    }
+
+    /// Attach an observer before admission or execution; existing frames are announced in order.
+    pub fn set_state_observer(&mut self, observer: Option<SharedStateObserver>) {
+        self.observer = observer;
+        if let Some(observer) = &self.observer {
+            let mut parent_id = None;
+            for frame in &mut self.stack {
+                frame.frame_id = self.next_frame_id;
+                self.next_frame_id += 1;
+                observer.borrow_mut().observe(StateEvent::Nest {
+                    frame_id: frame.frame_id,
+                    parent_id,
+                });
+                parent_id = Some(frame.frame_id);
+            }
         }
     }
 
@@ -234,9 +284,11 @@ impl<'a> RollbackWrapper<'a> {
     }
 
     pub fn nest(&mut self) {
+        let frame_id = open_observed_frame(&self.observer, &mut self.next_frame_id, &self.stack);
         self.stack.push(RollbackContext {
             edits: Vec::new(),
             metadata_edits: Vec::new(),
+            frame_id,
         });
     }
 
@@ -257,6 +309,13 @@ impl<'a> RollbackWrapper<'a> {
 
         for (key, value) in last_item.metadata_edits.drain(..) {
             rollback_lookup_map(&key, &value, &mut self.metadata_lookup_map)?;
+        }
+
+        if let Some(observer) = &self.observer {
+            observer.borrow_mut().observe(StateEvent::Rollback {
+                frame_id: last_item.frame_id,
+                parent_id: self.stack.last().map(|frame| frame.frame_id),
+            });
         }
 
         Ok(())
@@ -305,6 +364,13 @@ impl<'a> RollbackWrapper<'a> {
             }
         }
 
+        if let Some(observer) = &self.observer {
+            observer.borrow_mut().observe(StateEvent::Commit {
+                frame_id: last_item.frame_id,
+                parent_id: self.stack.last().map(|frame| frame.frame_id),
+            });
+        }
+
         Ok(())
     }
 }
@@ -324,6 +390,11 @@ fn inner_put_data<T>(
 
 impl RollbackWrapper<'_> {
     pub fn put_data(&mut self, key: &str, value: &str) -> Result<(), VmExecutionError> {
+        let before = if self.observer.is_some() {
+            Some(self.visible_data(key))
+        } else {
+            None
+        };
         let current = self.stack.last_mut().ok_or_else(|| {
             VmInternalError::Expect("ERROR: Clarity VM attempted PUT on non-nested context.".into())
         })?;
@@ -334,7 +405,24 @@ impl RollbackWrapper<'_> {
             key.to_string(),
             value.to_string(),
         );
+        if let (Some(observer), Some(before)) = (&self.observer, before) {
+            observer.borrow_mut().observe(StateEvent::Write {
+                frame_id: current.frame_id,
+                key: StateKey::Data(key),
+                before: before.as_ref().map(|value| value.as_deref()),
+                after: value,
+            });
+        }
         Ok(())
+    }
+
+    fn visible_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
+        if self.query_pending_data {
+            if let Some(value) = self.lookup_map.get(key).and_then(|values| values.last()) {
+                return Ok(Some(value.clone()));
+            }
+        }
+        self.store.get_data(key)
     }
 
     /// Returns whether or not the wrapper is currently retargeted to another block by e.g. an
@@ -512,6 +600,11 @@ impl RollbackWrapper<'_> {
         key: &str,
         value: &str,
     ) -> Result<(), VmInternalError> {
+        let before = if self.observer.is_some() {
+            Some(self.get_metadata(contract, key))
+        } else {
+            None
+        };
         let current = self.stack.last_mut().ok_or_else(|| {
             VmInternalError::Expect("ERROR: Clarity VM attempted PUT on non-nested context.".into())
         })?;
@@ -524,6 +617,14 @@ impl RollbackWrapper<'_> {
             metadata_key,
             value.to_string(),
         );
+        if let (Some(observer), Some(before)) = (&self.observer, before) {
+            observer.borrow_mut().observe(StateEvent::Write {
+                frame_id: current.frame_id,
+                key: StateKey::Metadata { contract, key },
+                before: before.as_ref().map(|value| value.as_deref()),
+                after: value,
+            });
+        }
         Ok(())
     }
 
@@ -624,5 +725,203 @@ impl RollbackWrapper<'_> {
             let metadata_key = (contract.clone(), (*key).to_string());
             self.metadata_lookup_map.contains_key(&metadata_key)
         })
+    }
+}
+
+#[cfg(all(test, feature = "rusqlite"))]
+mod observer_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::vm::database::MemoryBackingStore;
+    use crate::vm::hooks::StateObserver;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Recorded {
+        Nest(u64, Option<u64>),
+        Commit(u64, Option<u64>),
+        Rollback(u64, Option<u64>),
+        Write(u64, String, Result<Option<String>, ()>, String),
+    }
+
+    #[derive(Default)]
+    struct Recorder(Vec<Recorded>);
+
+    impl StateObserver for Recorder {
+        fn observe(&mut self, event: StateEvent<'_>) {
+            self.0.push(match event {
+                StateEvent::Nest {
+                    frame_id,
+                    parent_id,
+                } => Recorded::Nest(frame_id, parent_id),
+                StateEvent::Commit {
+                    frame_id,
+                    parent_id,
+                } => Recorded::Commit(frame_id, parent_id),
+                StateEvent::Rollback {
+                    frame_id,
+                    parent_id,
+                } => Recorded::Rollback(frame_id, parent_id),
+                StateEvent::Write {
+                    frame_id,
+                    key,
+                    before,
+                    after,
+                } => {
+                    let key = match key {
+                        StateKey::Data(key) => format!("data:{key}"),
+                        StateKey::Metadata { contract, key } => {
+                            format!("metadata:{contract}:{key}")
+                        }
+                    };
+                    Recorded::Write(
+                        frame_id,
+                        key,
+                        before.map(|value| value.map(str::to_owned)).map_err(|_| ()),
+                        after.to_owned(),
+                    )
+                }
+            });
+        }
+    }
+
+    fn write(frame: u64, before: Option<&str>, after: &str) -> Recorded {
+        Recorded::Write(
+            frame,
+            "data:k".into(),
+            Ok(before.map(str::to_owned)),
+            after.into(),
+        )
+    }
+
+    #[test]
+    fn observes_nested_commit_then_outer_rollback() {
+        let mut store = MemoryBackingStore::default();
+        let recorder = Rc::new(RefCell::new(Recorder::default()));
+        let mut wrapper = RollbackWrapper::new(&mut store);
+        wrapper.set_state_observer(Some(recorder.clone()));
+        wrapper.nest();
+        wrapper.put_data("k", "outer").unwrap();
+        wrapper.nest();
+        wrapper.put_data("k", "child").unwrap();
+        wrapper.commit().unwrap();
+        assert_eq!(
+            wrapper.get_data::<String>("k").unwrap(),
+            Some("child".into())
+        );
+        wrapper.rollback().unwrap();
+        wrapper.nest();
+        assert_eq!(wrapper.get_data::<String>("k").unwrap(), None);
+        wrapper.rollback().unwrap();
+        assert_eq!(
+            recorder.borrow().0,
+            vec![
+                Recorded::Nest(1, None),
+                write(1, None, "outer"),
+                Recorded::Nest(2, Some(1)),
+                write(2, Some("outer"), "child"),
+                Recorded::Commit(2, Some(1)),
+                Recorded::Rollback(1, None),
+                Recorded::Nest(3, None),
+                Recorded::Rollback(3, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_aborted_writes_match_disabled_execution() {
+        fn execute(observer: Option<SharedStateObserver>) -> Option<String> {
+            let mut store = MemoryBackingStore::default();
+            let mut wrapper = RollbackWrapper::new(&mut store);
+            wrapper.set_state_observer(observer);
+            wrapper.nest();
+            wrapper.put_data("k", "first").unwrap();
+            wrapper.put_data("k", "second").unwrap();
+            wrapper.nest();
+            wrapper.put_data("k", "aborted").unwrap();
+            wrapper.put_data("k", "aborted-again").unwrap();
+            wrapper.rollback().unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("k").unwrap(),
+                Some("second".into())
+            );
+            wrapper.put_data("k", "final").unwrap();
+            wrapper.commit().unwrap();
+            wrapper.nest();
+            let result = wrapper.get_data::<String>("k").unwrap();
+            wrapper.rollback().unwrap();
+            result
+        }
+        let recorder = Rc::new(RefCell::new(Recorder::default()));
+        let observed = execute(Some(recorder.clone()));
+        assert_eq!(observed, execute(None));
+        assert_eq!(observed, Some("final".into()));
+        assert_eq!(
+            recorder.borrow().0,
+            vec![
+                Recorded::Nest(1, None),
+                write(1, None, "first"),
+                write(1, Some("first"), "second"),
+                Recorded::Nest(2, Some(1)),
+                write(2, Some("second"), "aborted"),
+                write(2, Some("aborted"), "aborted-again"),
+                Recorded::Rollback(2, Some(1)),
+                write(1, Some("second"), "final"),
+                Recorded::Commit(1, None),
+                Recorded::Nest(3, None),
+                Recorded::Rollback(3, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn observer_survives_persisted_log_and_metadata_read_failure() {
+        let mut store = MemoryBackingStore::default();
+        let recorder = Rc::new(RefCell::new(Recorder::default()));
+        let contract = QualifiedContractIdentifier::transient();
+        let mut wrapper = RollbackWrapper::new(&mut store);
+        wrapper.nest();
+        wrapper.set_state_observer(Some(recorder.clone()));
+        wrapper.put_data("k", "before-conversion").unwrap();
+        let mut log = RollbackWrapperPersistedLog::from(wrapper);
+        log.nest();
+        let mut wrapper = RollbackWrapper::from_persisted_log(&mut store, log);
+        wrapper.put_data("k", "after-conversion").unwrap();
+        wrapper
+            .insert_metadata(&contract, "missing", "first")
+            .unwrap();
+        wrapper
+            .insert_metadata(&contract, "missing", "second")
+            .unwrap();
+        wrapper.rollback().unwrap();
+        assert_eq!(
+            wrapper.get_data::<String>("k").unwrap(),
+            Some("before-conversion".into())
+        );
+        wrapper.rollback().unwrap();
+        assert_eq!(
+            recorder.borrow().0,
+            vec![
+                Recorded::Nest(1, None),
+                write(1, None, "before-conversion"),
+                Recorded::Nest(2, Some(1)),
+                write(2, Some("before-conversion"), "after-conversion"),
+                Recorded::Write(
+                    2,
+                    format!("metadata:{contract}:missing"),
+                    Err(()),
+                    "first".into()
+                ),
+                Recorded::Write(
+                    2,
+                    format!("metadata:{contract}:missing"),
+                    Ok(Some("first".into())),
+                    "second".into(),
+                ),
+                Recorded::Rollback(2, Some(1)),
+                Recorded::Rollback(1, None),
+            ]
+        );
     }
 }

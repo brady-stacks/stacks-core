@@ -103,6 +103,101 @@ impl TryFrom<&str> for StoreType {
     }
 }
 
+/// Storage-owned classification of a canonical state key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSubject<'a> {
+    /// Contract data variable.
+    Variable { contract: &'a str, name: &'a str },
+    /// Contract map entry; `entry` is the serialized Clarity key.
+    Map {
+        contract: &'a str,
+        name: &'a str,
+        entry: &'a str,
+    },
+    /// Account STX balance.
+    StxBalance { principal: &'a str },
+    /// Account nonce.
+    Nonce { principal: &'a str },
+    /// Fungible token balance.
+    FtBalance {
+        contract: &'a str,
+        name: &'a str,
+        principal: &'a str,
+    },
+    /// Fungible token circulating supply.
+    FtSupply { contract: &'a str, name: &'a str },
+    /// Non-fungible token ownership; `asset` is the serialized Clarity identifier.
+    NftOwnership {
+        contract: &'a str,
+        name: &'a str,
+        asset: &'a str,
+    },
+    /// Contract commitment installed in consensus storage.
+    ContractInstallation { contract: &'a str },
+    /// Contract installation and definition metadata.
+    ContractMetadata {
+        contract: &'a QualifiedContractIdentifier,
+        key: &'a str,
+    },
+    /// An internal key without a public subject classification.
+    Unknown,
+}
+
+/// Decode the storage namespace and canonical key without allocating.
+pub fn describe_state_key(key: crate::vm::hooks::StateKey<'_>) -> StateSubject<'_> {
+    use crate::vm::hooks::StateKey;
+    match key {
+        StateKey::Metadata { contract, key } => StateSubject::ContractMetadata { contract, key },
+        StateKey::Data(key) => {
+            if let Some(contract) = key.strip_prefix("clarity-contract::") {
+                return StateSubject::ContractInstallation { contract };
+            }
+            if let Some(account) = key.strip_prefix("vm-account::") {
+                let Some((principal, kind)) = account.rsplit_once("::") else {
+                    return StateSubject::Unknown;
+                };
+                return match StoreType::try_from(kind) {
+                    Ok(StoreType::STXBalance) => StateSubject::StxBalance { principal },
+                    Ok(StoreType::Nonce) => StateSubject::Nonce { principal },
+                    _ => StateSubject::Unknown,
+                };
+            }
+            let Some(key) = key.strip_prefix("vm::") else {
+                return StateSubject::Unknown;
+            };
+            let mut parts = key.splitn(4, "::");
+            let (Some(contract), Some(kind), Some(name)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                return StateSubject::Unknown;
+            };
+            let entry = parts.next();
+            match (StoreType::try_from(kind), entry) {
+                (Ok(StoreType::Variable), None) => StateSubject::Variable { contract, name },
+                (Ok(StoreType::DataMap), Some(entry)) => StateSubject::Map {
+                    contract,
+                    name,
+                    entry,
+                },
+                (Ok(StoreType::FungibleToken), Some(principal)) => StateSubject::FtBalance {
+                    contract,
+                    name,
+                    principal,
+                },
+                (Ok(StoreType::CirculatingSupply), None) => {
+                    StateSubject::FtSupply { contract, name }
+                }
+                (Ok(StoreType::NonFungibleToken), Some(asset)) => StateSubject::NftOwnership {
+                    contract,
+                    name,
+                    asset,
+                },
+                _ => StateSubject::Unknown,
+            }
+        }
+    }
+}
+
 pub enum ContractDataVarName {
     Contract,
     ContractSize,
@@ -497,6 +592,11 @@ impl<'a> ClarityDatabase<'a> {
             burn_state_db,
             execution_cache: None,
         }
+    }
+
+    /// Attach a shared rollback-aware state observer before admission or execution.
+    pub fn set_state_observer(&mut self, observer: Option<crate::vm::hooks::SharedStateObserver>) {
+        self.store.set_state_observer(observer);
     }
 
     /// Attach a [`ClarityExecutionCache`] to this instance for the duration of its lifetime.
@@ -2643,6 +2743,109 @@ impl ClarityDatabase<'_> {
             .ok_or_else(|| VmInternalError::Expect("Failed to get block data.".into()))?;
         Ok(epoch.epoch_id)
     }
+}
+
+#[test]
+fn state_subjects_decode_canonical_storage_keys() {
+    use crate::vm::database::clarity_store::make_contract_hash_key;
+    use crate::vm::hooks::StateKey;
+
+    let contract = QualifiedContractIdentifier::transient();
+    let contract_name = contract.to_string();
+    let principal = PrincipalData::Contract(contract.clone());
+    let principal_name = principal.to_string();
+    let encoded = Value::UInt(7).serialize_to_hex().unwrap();
+    let variable = ClarityDatabase::make_key_for_trip(&contract, StoreType::Variable, "value");
+    assert_eq!(
+        describe_state_key(StateKey::Data(&variable)),
+        StateSubject::Variable {
+            contract: &contract_name,
+            name: "value"
+        },
+    );
+    let map = ClarityDatabase::make_key_for_data_map_entry(&contract, "entries", &Value::UInt(7))
+        .unwrap();
+    assert_eq!(
+        describe_state_key(StateKey::Data(&map)),
+        StateSubject::Map {
+            contract: &contract_name,
+            name: "entries",
+            entry: &encoded
+        },
+    );
+    let balance = ClarityDatabase::make_key_for_account_balance(&principal);
+    assert_eq!(
+        describe_state_key(StateKey::Data(&balance)),
+        StateSubject::StxBalance {
+            principal: &principal_name
+        },
+    );
+    let nonce = ClarityDatabase::make_key_for_account_nonce(&principal);
+    assert_eq!(
+        describe_state_key(StateKey::Data(&nonce)),
+        StateSubject::Nonce {
+            principal: &principal_name
+        },
+    );
+    let ft = ClarityDatabase::make_key_for_quad(
+        &contract,
+        StoreType::FungibleToken,
+        "coin",
+        &principal_name,
+    );
+    assert_eq!(
+        describe_state_key(StateKey::Data(&ft)),
+        StateSubject::FtBalance {
+            contract: &contract_name,
+            name: "coin",
+            principal: &principal_name
+        },
+    );
+    let supply =
+        ClarityDatabase::make_key_for_trip(&contract, StoreType::CirculatingSupply, "coin");
+    assert_eq!(
+        describe_state_key(StateKey::Data(&supply)),
+        StateSubject::FtSupply {
+            contract: &contract_name,
+            name: "coin"
+        },
+    );
+    let nft = ClarityDatabase::make_key_for_quad(
+        &contract,
+        StoreType::NonFungibleToken,
+        "collectible",
+        &encoded,
+    );
+    assert_eq!(
+        describe_state_key(StateKey::Data(&nft)),
+        StateSubject::NftOwnership {
+            contract: &contract_name,
+            name: "collectible",
+            asset: &encoded
+        },
+    );
+    let installation = make_contract_hash_key(&contract);
+    assert_eq!(
+        describe_state_key(StateKey::Data(&installation)),
+        StateSubject::ContractInstallation {
+            contract: &contract_name
+        },
+    );
+    let metadata = ClarityDatabase::make_metadata_key(StoreType::Contract, "contract");
+    assert_eq!(
+        describe_state_key(StateKey::Metadata {
+            contract: &contract,
+            key: &metadata
+        }),
+        StateSubject::ContractMetadata {
+            contract: &contract,
+            key: &metadata
+        },
+    );
+    assert_eq!(
+        describe_state_key(StateKey::Data("internal")),
+        StateSubject::Unknown
+    );
 }
 
 #[test]
